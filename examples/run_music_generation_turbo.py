@@ -122,6 +122,10 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
     
     Compiled artifacts are saved to ~/.cache/heartlib_compiled and reused
     on subsequent runs for instant loading.
+    
+    NOTE: HeartCodec flow_matching.estimator is SKIPPED due to Inductor
+    compatibility issues with positional encoding (NaN bounds checking bug).
+    The HeartMuLa components provide the main speedup anyway.
     """
     if verbose:
         print(f"\n{'='*60}")
@@ -135,44 +139,63 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
     mula = pipe.mula
     codec = pipe.codec
     
+    compiled_count = 0
+    
     # Compile HeartMuLa backbone (the main LLM - biggest speedup)
     if verbose:
-        print("[1/4] Compiling HeartMuLa backbone...")
-    mula.backbone = torch.compile(
-        mula.backbone,
-        mode=compile_mode,
-        fullgraph=False,  # Allow graph breaks for flexibility
-    )
+        print("[1/3] Compiling HeartMuLa backbone...")
+    try:
+        mula.backbone = torch.compile(
+            mula.backbone,
+            mode=compile_mode,
+            fullgraph=False,  # Allow graph breaks for flexibility
+        )
+        compiled_count += 1
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠️  Failed to compile backbone: {e}")
     
     # Compile HeartMuLa decoder (smaller transformer for codebook prediction)
     if verbose:
-        print("[2/4] Compiling HeartMuLa decoder...")
-    mula.decoder = torch.compile(
-        mula.decoder,
-        mode=compile_mode,
-        fullgraph=False,
-    )
+        print("[2/3] Compiling HeartMuLa decoder...")
+    try:
+        mula.decoder = torch.compile(
+            mula.decoder,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        compiled_count += 1
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠️  Failed to compile decoder: {e}")
     
-    # Compile HeartCodec flow matching estimator (DiT-style transformer)
+    # SKIP: HeartCodec flow_matching.estimator
+    # This has Inductor compatibility issues with positional encoding
+    # causing "TypeError: Invalid NaN comparison" during compilation.
+    # The speedup from HeartMuLa compilation is the main benefit anyway.
     if verbose:
-        print("[3/4] Compiling HeartCodec flow matching estimator...")
-    codec.flow_matching.estimator = torch.compile(
-        codec.flow_matching.estimator,
-        mode=compile_mode,
-        fullgraph=False,
-    )
+        print("[3/3] Skipping HeartCodec flow_matching.estimator (Inductor incompatible)")
+        print("      Reason: Positional encoding causes NaN bounds checking errors")
     
-    # Compile scalar model (audio decoder)
+    # Compile scalar model (audio decoder) - optional, try with fallback
     if verbose:
-        print("[4/4] Compiling HeartCodec scalar model...")
-    codec.scalar_model = torch.compile(
-        codec.scalar_model,
-        mode=compile_mode,
-        fullgraph=False,
-    )
+        print("[+] Attempting to compile HeartCodec scalar model...")
+    try:
+        codec.scalar_model = torch.compile(
+            codec.scalar_model,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+        compiled_count += 1
+        if verbose:
+            print("      ✓ scalar_model compiled successfully")
+    except Exception as e:
+        if verbose:
+            print(f"      ⚠️  Skipped scalar_model: {e}")
     
     if verbose:
         print(f"\nCompilation setup complete in {time.time() - compile_start:.2f}s")
+        print(f"Successfully compiled {compiled_count} components")
         print("(Actual compilation happens on first forward pass)\n")
     
     return pipe
