@@ -24,13 +24,23 @@ import argparse
 CACHE_DIR = os.path.expanduser("~/.cache/heartlib_compiled")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Enable persistent compilation caching
-os.environ["TORCH_COMPILE_CACHE_DIR"] = CACHE_DIR
+# Triton kernel cache (the .cubin/.ptx files you're seeing)
+os.environ["TRITON_CACHE_DIR"] = os.path.join(CACHE_DIR, "triton")
+
+# TorchInductor caches
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
+
+# FX Graph cache - caches the compiled graph structure (CRITICAL for speedup)
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+
+# AOTAutograd cache - caches autograd compilation (requires FX_GRAPH_CACHE=1)
+os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
 
 # Optional: Reduce recompilation overhead
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
+
+# Disable cache validation for faster loads (set to 0 if you update PyTorch)
+# os.environ["TORCHINDUCTOR_CACHE_VALIDATE"] = "0"
 
 import torch
 import torch.nn.functional as F
