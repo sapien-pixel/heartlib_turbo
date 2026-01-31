@@ -1,13 +1,16 @@
 """
-HeartMuLa Turbo - Optimized Music Generation with torch.compile and Persistent Caching
+HeartMuLa Turbo - Optimized Music Generation with Multiple Optimizations
 
-This script provides significant speedups through:
-1. torch.compile() with persistent caching (compiled artifacts saved to disk)
-2. Optimized model components (backbone, decoder, flow matching, scalar model)
-3. Optional warmup to trigger compilation before actual inference
+Optimizations applied:
+1. torch.compile() with persistent caching
+2. Flash Attention (enabled by default on A100/H100)
+3. Reduced flow matching steps (configurable)
+4. Optional CFG disable for 2x speedup
+5. Disable progress bars for reduced overhead
+6. Memory-efficient attention backends
 
 First run: Slow (~2-5 minutes) as models are compiled
-Subsequent runs: Fast (~5-10 seconds) as compiled artifacts are loaded from cache
+Subsequent runs: Fast as compiled artifacts are loaded from cache
 """
 
 import os
@@ -30,6 +33,7 @@ os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
 import torch
+import torch.nn.functional as F
 from heartlib import HeartMuLaGenPipeline
 
 
@@ -105,27 +109,88 @@ def parse_args():
     # Optimization options
     parser.add_argument("--compile", type=str2bool, default=True,
                         help="Enable torch.compile() optimization")
-    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+    parser.add_argument("--compile_mode", type=str, default="default",
                         choices=["default", "reduce-overhead", "max-autotune"],
-                        help="torch.compile mode")
+                        help="torch.compile mode (default recommended since CUDA graphs fail)")
     parser.add_argument("--warmup", type=str2bool, default=False,
                         help="Run warmup pass to trigger compilation")
     parser.add_argument("--warmup_length_ms", type=int, default=5000,
                         help="Warmup audio length in milliseconds")
     
+    # NEW: Additional optimizations
+    parser.add_argument("--flow_steps", type=int, default=10,
+                        help="Number of flow matching steps (fewer = faster, 5-10 recommended)")
+    parser.add_argument("--disable_progress", type=str2bool, default=True,
+                        help="Disable tqdm progress bars for reduced overhead")
+    parser.add_argument("--flash_attention", type=str2bool, default=True,
+                        help="Enable Flash Attention if available")
+    
     return parser.parse_args()
 
 
-def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
+def enable_flash_attention(verbose=True):
+    """Enable Flash Attention and memory-efficient attention backends."""
+    if verbose:
+        print("\nConfiguring attention backends:")
+    
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        if verbose:
+            print("  ⚠️  CUDA not available, skipping attention optimization")
+        return
+    
+    # Get GPU info
+    gpu_name = torch.cuda.get_device_name(0)
+    compute_capability = torch.cuda.get_device_capability(0)
+    
+    if verbose:
+        print(f"  GPU: {gpu_name}")
+        print(f"  Compute Capability: {compute_capability[0]}.{compute_capability[1]}")
+    
+    # Enable Flash Attention (requires compute capability >= 8.0 for best performance)
+    try:
+        # Enable Flash SDP (Scaled Dot Product) attention
+        torch.backends.cuda.enable_flash_sdp(True)
+        if verbose:
+            print("  ✓ Flash Attention (Flash SDP) enabled")
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠️  Flash SDP not available: {e}")
+    
+    try:
+        # Enable memory-efficient attention as fallback
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        if verbose:
+            print("  ✓ Memory-efficient attention enabled")
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠️  Memory-efficient SDP not available: {e}")
+    
+    # Enable math SDP as final fallback
+    try:
+        torch.backends.cuda.enable_math_sdp(True)
+        if verbose:
+            print("  ✓ Math SDP fallback enabled")
+    except Exception:
+        pass
+    
+    # Additional CUDA optimizations
+    try:
+        torch.backends.cudnn.benchmark = True
+        if verbose:
+            print("  ✓ cuDNN benchmark mode enabled")
+    except Exception:
+        pass
+    
+    return
+
+
+def compile_pipeline(pipe, compile_mode="default", verbose=True):
     """
     Compile the pipeline components with persistent caching.
     
-    Compiled artifacts are saved to ~/.cache/heartlib_compiled and reused
-    on subsequent runs for instant loading.
-    
     NOTE: HeartCodec flow_matching.estimator is SKIPPED due to Inductor
     compatibility issues with positional encoding (NaN bounds checking bug).
-    The HeartMuLa components provide the main speedup anyway.
     """
     if verbose:
         print(f"\n{'='*60}")
@@ -135,7 +200,7 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
     
     compile_start = time.time()
     
-    # Access models to ensure they're loaded (triggers lazy loading if enabled)
+    # Access models to ensure they're loaded
     mula = pipe.mula
     codec = pipe.codec
     
@@ -148,14 +213,14 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
         mula.backbone = torch.compile(
             mula.backbone,
             mode=compile_mode,
-            fullgraph=False,  # Allow graph breaks for flexibility
+            fullgraph=False,
         )
         compiled_count += 1
     except Exception as e:
         if verbose:
             print(f"  ⚠️  Failed to compile backbone: {e}")
     
-    # Compile HeartMuLa decoder (smaller transformer for codebook prediction)
+    # Compile HeartMuLa decoder
     if verbose:
         print("[2/3] Compiling HeartMuLa decoder...")
     try:
@@ -169,15 +234,11 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
         if verbose:
             print(f"  ⚠️  Failed to compile decoder: {e}")
     
-    # SKIP: HeartCodec flow_matching.estimator
-    # This has Inductor compatibility issues with positional encoding
-    # causing "TypeError: Invalid NaN comparison" during compilation.
-    # The speedup from HeartMuLa compilation is the main benefit anyway.
+    # SKIP flow_matching.estimator (Inductor incompatible)
     if verbose:
-        print("[3/3] Skipping HeartCodec flow_matching.estimator (Inductor incompatible)")
-        print("      Reason: Positional encoding causes NaN bounds checking errors")
+        print("[3/3] Skipping flow_matching.estimator (Inductor incompatible)")
     
-    # Compile scalar model (audio decoder) - optional, try with fallback
+    # Compile scalar model
     if verbose:
         print("[+] Attempting to compile HeartCodec scalar model...")
     try:
@@ -191,62 +252,160 @@ def compile_pipeline(pipe, compile_mode="reduce-overhead", verbose=True):
             print("      ✓ scalar_model compiled successfully")
     except Exception as e:
         if verbose:
-            print(f"      ⚠️  Skipped scalar_model: {e}")
+            print(f"      ⚠️  Skipped: {e}")
     
     if verbose:
         print(f"\nCompilation setup complete in {time.time() - compile_start:.2f}s")
-        print(f"Successfully compiled {compiled_count} components")
-        print("(Actual compilation happens on first forward pass)\n")
+        print(f"Successfully compiled {compiled_count} components\n")
     
     return pipe
 
 
-def warmup_compiled_model(pipe, warmup_length_ms=5000, verbose=True):
+def optimized_postprocess(pipe, model_outputs, save_path, flow_steps=10, 
+                          disable_progress=True, verbose=True):
     """
-    Run a warmup pass to trigger actual compilation.
+    Optimized postprocessing with configurable flow matching steps.
     
-    This is optional but recommended for:
-    - First-time runs (populates the cache)
-    - Benchmarking (ensures compiled model is ready)
+    Default is 10 steps. Reducing to 5-7 can give ~50% speedup on codec
+    with minimal quality loss.
     """
+    import torchaudio
+    
+    frames = model_outputs["frames"].to(pipe.codec_device)
+    
+    if verbose:
+        print(f"  Flow matching steps: {flow_steps}")
+    
+    # Call detokenize with custom num_steps
+    wav = pipe.codec.detokenize(
+        frames, 
+        num_steps=flow_steps,
+        disable_progress=disable_progress,
+    )
+    
+    pipe._unload()
+    torchaudio.save(save_path, wav.to(torch.float32).cpu(), 48000)
+
+
+def optimized_forward(pipe, model_inputs, max_audio_length_ms, temperature, 
+                      topk, cfg_scale, disable_progress=True):
+    """
+    Optimized forward pass with optional progress bar disable.
+    """
+    from tqdm import tqdm
+    
+    prompt_tokens = model_inputs["tokens"].to(pipe.mula_device)
+    prompt_tokens_mask = model_inputs["tokens_mask"].to(pipe.mula_device)
+    continuous_segment = model_inputs["muq_embed"].to(pipe.mula_device)
+    starts = model_inputs["muq_idx"]
+    prompt_pos = model_inputs["pos"].to(pipe.mula_device)
+    frames = []
+
+    bs_size = 2 if cfg_scale != 1.0 else 1
+    pipe.mula.setup_caches(bs_size)
+    
+    with torch.autocast(device_type=pipe.mula_device.type, dtype=pipe.mula_dtype):
+        curr_token = pipe.mula.generate_frame(
+            tokens=prompt_tokens,
+            tokens_mask=prompt_tokens_mask,
+            input_pos=prompt_pos,
+            temperature=temperature,
+            topk=topk,
+            cfg_scale=cfg_scale,
+            continuous_segments=continuous_segment,
+            starts=starts,
+        )
+    frames.append(curr_token[0:1,])
+
+    def _pad_audio_token(token):
+        padded_token = (
+            torch.ones(
+                (token.shape[0], pipe._parallel_number),
+                device=token.device,
+                dtype=torch.long,
+            )
+            * pipe.config.empty_id
+        )
+        padded_token[:, :-1] = token
+        padded_token = padded_token.unsqueeze(1)
+        padded_token_mask = torch.ones_like(
+            padded_token, device=token.device, dtype=torch.bool
+        )
+        padded_token_mask[..., -1] = False
+        return padded_token, padded_token_mask
+
+    max_audio_frames = max_audio_length_ms // 80
+    
+    # Use tqdm or simple range based on disable_progress
+    iterator = range(max_audio_frames)
+    if not disable_progress:
+        iterator = tqdm(iterator)
+
+    for i in iterator:
+        curr_token, curr_token_mask = _pad_audio_token(curr_token)
+        with torch.autocast(
+            device_type=pipe.mula_device.type, dtype=pipe.mula_dtype
+        ):
+            curr_token = pipe.mula.generate_frame(
+                tokens=curr_token,
+                tokens_mask=curr_token_mask,
+                input_pos=prompt_pos[..., -1:] + i + 1,
+                temperature=temperature,
+                topk=topk,
+                cfg_scale=cfg_scale,
+                continuous_segments=None,
+                starts=None,
+            )
+        if torch.any(curr_token[0:1, :] >= pipe.config.audio_eos_id):
+            break
+        frames.append(curr_token[0:1,])
+    
+    frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+    pipe._unload()
+    return {"frames": frames}
+
+
+def warmup_compiled_model(pipe, warmup_length_ms=5000, flow_steps=10, verbose=True):
+    """Run a warmup pass to trigger compilation."""
     if verbose:
         print(f"\n{'='*60}")
         print("Running warmup pass to trigger compilation...")
-        print("(This may take a few minutes on first run)")
         print(f"{'='*60}\n")
     
     warmup_start = time.time()
     
-    # Use simple inputs for warmup
     dummy_input = {
         "tags": "pop, upbeat, electronic, dance",
         "lyrics": "la la la warmup test audio generation"
     }
     
-    # Create temp output path
     import tempfile
     warmup_output = os.path.join(tempfile.gettempdir(), "heartlib_warmup.mp3")
     
     with torch.no_grad():
-        pipe(
-            dummy_input,
-            max_audio_length_ms=warmup_length_ms,
-            save_path=warmup_output,
-            cfg_scale=1.0,  # No CFG for faster warmup
-            topk=50,
-            temperature=1.0,
+        # Preprocess
+        preprocess_kwargs = {"cfg_scale": 1.0}
+        model_inputs = pipe.preprocess(dummy_input, **preprocess_kwargs)
+        
+        # Forward with optimized function
+        model_outputs = optimized_forward(
+            pipe, model_inputs, warmup_length_ms, 
+            temperature=1.0, topk=50, cfg_scale=1.0,
+            disable_progress=True
+        )
+        
+        # Postprocess with optimized function
+        optimized_postprocess(
+            pipe, model_outputs, warmup_output,
+            flow_steps=flow_steps, disable_progress=True,
+            verbose=False
         )
     
-    # Clean up warmup file
     if os.path.exists(warmup_output):
         os.remove(warmup_output)
     
-    warmup_time = time.time() - warmup_start
     if verbose:
-        print(f"\nWarmup complete in {warmup_time:.2f}s")
-        print("Compiled model is now cached for fast subsequent runs.\n")
-    
-    return warmup_time
+        print(f"\nWarmup complete in {time.time() - warmup_start:.2f}s\n")
 
 
 def main():
@@ -257,11 +416,18 @@ def main():
     print(f"{'='*60}")
     print(f"Model: {args.version}")
     print(f"Compile: {args.compile} (mode: {args.compile_mode})")
-    print(f"Warmup: {args.warmup}")
+    print(f"CFG Scale: {args.cfg_scale} {'(2x faster!)' if args.cfg_scale == 1.0 else ''}")
+    print(f"Flow Steps: {args.flow_steps} (default: 10)")
+    print(f"Flash Attention: {args.flash_attention}")
+    print(f"Progress Bars: {'disabled' if args.disable_progress else 'enabled'}")
     print(f"{'='*60}\n")
     
+    # Enable Flash Attention
+    if args.flash_attention:
+        enable_flash_attention(verbose=True)
+    
     # Load pipeline
-    print("Loading models...")
+    print("\nLoading models...")
     load_start = time.time()
     
     pipe = HeartMuLaGenPipeline.from_pretrained(
@@ -275,7 +441,7 @@ def main():
             "codec": args.codec_dtype,
         },
         version=args.version,
-        lazy_load=False,  # Must load models to compile them
+        lazy_load=False,
     )
     print(f"Models loaded in {time.time() - load_start:.2f}s")
     
@@ -283,40 +449,61 @@ def main():
     if args.compile:
         pipe = compile_pipeline(pipe, compile_mode=args.compile_mode)
         
-        # Optional warmup to trigger compilation
         if args.warmup:
-            warmup_compiled_model(pipe, warmup_length_ms=args.warmup_length_ms)
+            warmup_compiled_model(
+                pipe, 
+                warmup_length_ms=args.warmup_length_ms,
+                flow_steps=args.flow_steps
+            )
     
-    # Run actual inference
+    # Run inference
     print(f"\n{'='*60}")
     print("Generating music...")
     print(f"  Lyrics: {args.lyrics}")
     print(f"  Tags: {args.tags}")
     print(f"  Max length: {args.max_audio_length_ms / 1000:.1f}s")
     print(f"  CFG scale: {args.cfg_scale}")
+    print(f"  Flow steps: {args.flow_steps}")
     print(f"{'='*60}\n")
     
     inference_start = time.time()
     
     with torch.no_grad():
-        pipe(
-            {
-                "lyrics": args.lyrics,
-                "tags": args.tags,
-            },
-            max_audio_length_ms=args.max_audio_length_ms,
-            save_path=args.save_path,
-            topk=args.topk,
-            temperature=args.temperature,
-            cfg_scale=args.cfg_scale,
+        # Preprocess
+        preprocess_kwargs = {"cfg_scale": args.cfg_scale}
+        model_inputs = pipe.preprocess(
+            {"lyrics": args.lyrics, "tags": args.tags}, 
+            **preprocess_kwargs
         )
+        
+        # Forward with optimized function
+        forward_start = time.time()
+        model_outputs = optimized_forward(
+            pipe, model_inputs, args.max_audio_length_ms,
+            temperature=args.temperature, topk=args.topk, 
+            cfg_scale=args.cfg_scale,
+            disable_progress=args.disable_progress
+        )
+        forward_time = time.time() - forward_start
+        
+        # Postprocess with optimized function
+        postprocess_start = time.time()
+        optimized_postprocess(
+            pipe, model_outputs, args.save_path,
+            flow_steps=args.flow_steps,
+            disable_progress=args.disable_progress,
+            verbose=True
+        )
+        postprocess_time = time.time() - postprocess_start
     
     inference_time = time.time() - inference_start
     
     print(f"\n{'='*60}")
     print(f"Generation complete!")
     print(f"  Output: {args.save_path}")
-    print(f"  Inference time: {inference_time:.2f}s")
+    print(f"  HeartMuLa (token gen): {forward_time:.2f}s")
+    print(f"  HeartCodec (audio):    {postprocess_time:.2f}s")
+    print(f"  Total inference time:  {inference_time:.2f}s")
     print(f"{'='*60}\n")
 
 
