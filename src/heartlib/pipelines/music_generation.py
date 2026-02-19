@@ -94,6 +94,7 @@ class HeartMuLaGenPipeline:
         muq_mulan: Optional[Any],
         text_tokenizer: Tokenizer,
         config: HeartMuLaGenConfig,
+        compile_model: bool = False,
     ):
 
         self.muq_mulan = muq_mulan
@@ -110,6 +111,7 @@ class HeartMuLaGenPipeline:
         self.codec_dtype = heartcodec_dtype
         self.codec_path = heartcodec_path
         self.codec_device = heartcodec_device
+        self.compile_model = compile_model
 
         self._mula: Optional[HeartMuLa] = None
         self._codec: Optional[HeartCodec] = None
@@ -122,6 +124,13 @@ class HeartMuLaGenPipeline:
                 device_map=self.mula_device,
                 dtype=self.mula_dtype,
             )
+            if compile_model:
+                print("Compiling generate_frame with torch.compile...")
+                import torch._dynamo
+                torch._dynamo.config.capture_scalar_outputs = True
+                self._mula.generate_frame = torch.compile(
+                    self._mula.generate_frame, mode="default"
+                )
             self._codec = HeartCodec.from_pretrained(
                 self.codec_path,
                 device_map=self.codec_device,
@@ -138,6 +147,13 @@ class HeartMuLaGenPipeline:
             device_map=self.mula_device,
             dtype=self.mula_dtype,
         )
+        if self.compile_model:
+            print("Compiling generate_frame with torch.compile...")
+            import torch._dynamo
+            torch._dynamo.config.capture_scalar_outputs = True
+            self._mula.generate_frame = torch.compile(
+                self._mula.generate_frame, mode="default"
+            )
         return self._mula
 
     @property
@@ -357,6 +373,7 @@ class HeartMuLaGenPipeline:
         dtype: Union[torch.dtype, Dict[str, torch.dtype]],
         version: str,
         lazy_load: bool = False,
+        compile_model: bool = False,
     ):
 
         mula_path, codec_path, tokenizer_path, gen_config_path = _resolve_paths(
@@ -380,4 +397,5 @@ class HeartMuLaGenPipeline:
             config=gen_config,
             heartmula_dtype=mula_dtype,
             heartcodec_dtype=codec_dtype,
+            compile_model=compile_model,
         )
